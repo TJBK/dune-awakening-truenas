@@ -35,6 +35,9 @@ var (
 	flagLogFile        = flag.String("logfile", "", "also write logs to this file")
 	flagMaxSpend       = flag.Int64("maxspend", 0, "max Solaris the bot may spend buying player listings per tick (0 = unlimited)")
 	flagMaxListings    = flag.Int("maxlistings", 0, "max new bot listings to create per list tick (0 = unlimited)")
+	flagDynamicMarket  = flag.Bool("dynamicmarket", true, "adjust prices and listing depth from live market supply")
+	flagUndercut       = flag.Float64("undercut", 0.02, "dynamic pricing undercut below live market minimum (0.02 = 2%)")
+	flagMaxPriceStep   = flag.Float64("maxpricestep", 0.15, "max dynamic price movement per list tick")
 )
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -141,6 +144,9 @@ func main() {
 	ex.maxBuys = *flagMaxBuys
 	ex.maxSpendPerTick = *flagMaxSpend
 	ex.maxListingsPerTick = *flagMaxListings
+	ex.dynamicMarket = *flagDynamicMarket
+	ex.marketUndercut = *flagUndercut
+	ex.maxPriceStep = *flagMaxPriceStep
 	ex.dryRun = *flagDryRun
 	if ex.dryRun {
 		log.Println("DRY RUN enabled: market changes will be logged but not written")

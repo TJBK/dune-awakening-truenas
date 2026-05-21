@@ -75,6 +75,9 @@ type Exchange struct {
 	maxBuys            int
 	maxSpendPerTick    int64
 	maxListingsPerTick int
+	dynamicMarket      bool
+	marketUndercut     float64
+	maxPriceStep       float64
 	paused             bool
 	lastBuy            time.Time
 	lastList           time.Time
@@ -84,12 +87,14 @@ type Exchange struct {
 	totalTopped        int64
 	totalPruned        int64
 	totalErrors        int64
+	priceChanges       int64
 }
 
 // marketPrice holds real market stats from dune_exchange_get_item_price_stats.
 type marketPrice struct {
 	minimum int64
 	average int64
+	active  int64
 }
 
 func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Exchange, error) {
@@ -128,8 +133,8 @@ func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Ex
 }
 
 func (e *Exchange) StatusLine() string {
-	return fmt.Sprintf("status: dryrun=%t paused=%t bought=%d spent=%d created=%d topped=%d pruned=%d errors=%d last_buy=%s last_list=%s",
-		e.dryRun, e.paused, e.totalBought, e.totalSpent, e.totalCreated, e.totalTopped, e.totalPruned, e.totalErrors,
+	return fmt.Sprintf("status: dryrun=%t paused=%t dynamic=%t bought=%d spent=%d created=%d topped=%d pruned=%d price_changes=%d errors=%d last_buy=%s last_list=%s",
+		e.dryRun, e.paused, e.dynamicMarket, e.totalBought, e.totalSpent, e.totalCreated, e.totalTopped, e.totalPruned, e.priceChanges, e.totalErrors,
 		formatStatusTime(e.lastBuy), formatStatusTime(e.lastList))
 }
 
@@ -790,8 +795,9 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 				}
 			}
 
-			// Accumulate listings to create to reach listingsPerGrade.
-			for i := len(valid); i < listingsPerGrade; i++ {
+			// Accumulate listings to create to reach dynamic target depth.
+			targetListings := e.desiredListingsFor(item)
+			for i := len(valid); i < targetListings; i++ {
 				pending = append(pending, pendingListing{
 					item:      item,
 					basePrice: basePrice,
@@ -859,6 +865,28 @@ func (e *Exchange) Tick(ctx context.Context, catalog []CatalogItem) {
 	e.ListTick(ctx, catalog)
 }
 
+func (e *Exchange) desiredListingsFor(item CatalogItem) int {
+	if !e.dynamicMarket {
+		return listingsPerGrade
+	}
+	mp, ok := e.marketPrices[item.TemplateID]
+	if !ok || mp.active == 0 {
+		return listingsPerGrade + 2
+	}
+	switch {
+	case mp.active <= 2:
+		return listingsPerGrade + 3
+	case mp.active <= 6:
+		return listingsPerGrade + 1
+	case mp.active >= 30:
+		return 2
+	case mp.active >= 15:
+		return 3
+	default:
+		return listingsPerGrade
+	}
+}
+
 func (e *Exchange) updatePrices(ctx context.Context, catalog []CatalogItem) {
 	catalogMap := make(map[string]CatalogItem, len(catalog))
 	for _, item := range catalog {
@@ -899,19 +927,69 @@ func (e *Exchange) updatePrices(ctx context.Context, catalog []CatalogItem) {
 			frac = float64(sold) / float64(listed)
 		}
 		adjusted := adjustPrice(item, current, frac)
-
-		// Factor in real market prices: if players are undercutting us significantly,
-		// consider lowering our price toward the market minimum.
-		if mp, ok := e.marketPrices[tmpl]; ok && mp.minimum > 0 {
-			// If market min is below our adjusted price by >10%, move toward it.
-			if mp.minimum < int64(float64(adjusted)*0.9) {
-				// Don't go below our floor, but trend toward market.
-				adjusted = (adjusted + mp.minimum) / 2
-			}
+		if e.dynamicMarket {
+			adjusted = e.dynamicPrice(item, current, adjusted)
 		}
-
+		if adjusted != current {
+			log.Printf("price: %s %d → %d", tmpl, current, adjusted)
+			e.priceChanges++
+		}
 		e.prices[tmpl] = adjusted
 	}
+}
+
+func (e *Exchange) dynamicPrice(item CatalogItem, current, adjusted int64) int64 {
+	mp, ok := e.marketPrices[item.TemplateID]
+	if !ok || mp.minimum <= 0 {
+		return adjusted
+	}
+	floor := roundPrice(basePrice(item))
+	ceiling := floor * 5
+	if item.MinPrice > 0 && floor < item.MinPrice {
+		floor = item.MinPrice
+	}
+	if item.MaxPrice > 0 && ceiling > item.MaxPrice {
+		ceiling = item.MaxPrice
+	}
+
+	undercut := e.marketUndercut
+	if undercut < 0 {
+		undercut = 0
+	}
+	if undercut > 0.25 {
+		undercut = 0.25
+	}
+	target := int64(float64(mp.minimum) * (1 - undercut))
+	// When supply is scarce, price closer to average/min instead of undercutting hard.
+	if mp.active <= 2 && mp.average > target {
+		target = (target + mp.average) / 2
+	}
+	if target < floor {
+		target = floor
+	}
+	if target > ceiling {
+		target = ceiling
+	}
+	combined := (adjusted + target) / 2
+	step := e.maxPriceStep
+	if step <= 0 || step > 1 {
+		step = 0.15
+	}
+	maxUp := int64(float64(current) * (1 + step))
+	maxDown := int64(float64(current) * (1 - step))
+	if combined > maxUp {
+		combined = maxUp
+	}
+	if combined < maxDown {
+		combined = maxDown
+	}
+	if combined < floor {
+		combined = floor
+	}
+	if combined > ceiling {
+		combined = ceiling
+	}
+	return roundPrice(combined)
 }
 
 // fetchMarketPrices uses dune_exchange_get_item_price_stats to get real market

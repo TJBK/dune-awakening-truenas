@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -14,9 +13,7 @@ import (
 // ── config ────────────────────────────────────────────────────────────────────
 
 var (
-	sshHost         string
-	sshUser         string
-	sshKeyPath      string
+	appMode         string
 	itemDataPath    string
 	scripCurrencyID int
 	dbPort          int
@@ -27,35 +24,14 @@ var (
 )
 
 func init() {
-	flag.StringVar(&sshHost, "host", "192.168.0.72:22", "SSH host:port")
-	flag.StringVar(&sshUser, "user", "dune", "SSH user")
-	flag.StringVar(&sshKeyPath, "key", "", "SSH private key path (auto-detected if empty)")
+	flag.StringVar(&appMode, "mode", "amp", "Backend mode (only amp is supported)")
 	flag.StringVar(&itemDataPath, "itemdata", "", "Item data JSON path (stack_max/volume overrides)")
 	flag.IntVar(&scripCurrencyID, "scripcurrency", 1, "Scrip currency id (auto-detect if -1)")
-	flag.IntVar(&dbPort, "dbport", 15432, "PostgreSQL port inside the cluster")
+	flag.IntVar(&dbPort, "dbport", 15432, "PostgreSQL port")
 	flag.StringVar(&dbUser, "dbuser", "dune", "PostgreSQL user")
-	flag.StringVar(&dbPass, "dbpass", "dune", "PostgreSQL password")
+	flag.StringVar(&dbPass, "dbpass", "", "PostgreSQL password")
 	flag.StringVar(&dbName, "dbname", "dune", "PostgreSQL database name")
 	flag.StringVar(&dbSchema, "schema", "dune", "PostgreSQL schema")
-}
-
-func resolveKeyPath() string {
-	if sshKeyPath != "" {
-		return sshKeyPath
-	}
-	candidates := []string{
-		filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"),
-		filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa"),
-		filepath.Join(os.Getenv("HOME"), ".ssh", "dune"),
-		"../sshKey",
-		"./sshKey",
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return candidates[0]
 }
 
 func resolveItemDataPath() string {
@@ -106,6 +82,7 @@ func loadItemData() error {
 	// DB template_id is PascalCase (MelangeSpice) or lowercase (melangespice).
 	normalized := make(map[string]itemRule, len(parsed.Items))
 	for k, v := range parsed.Items {
+		v.TemplateID = k
 		normalized[strings.ToLower(k)] = v
 	}
 	parsed.Items = normalized
@@ -144,6 +121,10 @@ func loadItemNames() error {
 
 func main() {
 	flag.Parse()
+	if appMode != "amp" {
+		fmt.Fprintf(os.Stderr, "invalid -mode %q (only amp is supported)\n", appMode)
+		os.Exit(2)
+	}
 	if err := loadItemData(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -161,8 +142,5 @@ func main() {
 
 	if globalDB != nil {
 		globalDB.Close()
-	}
-	if globalSSH != nil {
-		globalSSH.Close()
 	}
 }

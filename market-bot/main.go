@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,10 +16,11 @@ import (
 )
 
 var (
-	flagDBHost       = flag.String("dbhost", "", "PostgreSQL host (required)")
+	flagMode         = flag.String("mode", "k3s", "runtime mode: k3s or amp")
+	flagDBHost       = flag.String("dbhost", "", "PostgreSQL host")
 	flagDBPort       = flag.Int("dbport", 15432, "PostgreSQL port")
 	flagDBUser       = flag.String("dbuser", "dune", "PostgreSQL user")
-	flagDBPass       = flag.String("dbpass", "dune", "PostgreSQL password")
+	flagDBPass       = flag.String("dbpass", "", "PostgreSQL password")
 	flagDBName       = flag.String("dbname", "dune", "PostgreSQL database")
 	flagCacheDB      = flag.String("cachedb", "/data/market-bot-cache.db", "SQLite path for category cache")
 	flagBuyInterval  = flag.Duration("buyinterval", 5*time.Minute, "how often to buy player listings")
@@ -38,22 +40,45 @@ func minDuration(a, b time.Duration) time.Duration {
 func main() {
 	flag.Parse()
 
-	if *flagDBHost == "" {
-		fmt.Fprintln(os.Stderr, "error: -dbhost is required")
+	mode := strings.ToLower(strings.TrimSpace(*flagMode))
+	switch mode {
+	case "k3s":
+		if *flagDBHost == "" {
+			fmt.Fprintln(os.Stderr, "error: -dbhost is required in k3s mode")
+			flag.Usage()
+			os.Exit(1)
+		}
+	case "amp":
+		if *flagDBHost == "" {
+			*flagDBHost = "127.0.0.1"
+		}
+		if *flagCacheDB == "/data/market-bot-cache.db" {
+			*flagCacheDB = "market-bot-cache.db"
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: unsupported mode %q (use k3s or amp)\n", *flagMode)
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("market-bot ")
+	log.Printf("mode: %s", mode)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		*flagDBHost, *flagDBPort, *flagDBUser, *flagDBPass, *flagDBName,
-	)
+	connParts := []string{
+		fmt.Sprintf("host=%s", *flagDBHost),
+		fmt.Sprintf("port=%d", *flagDBPort),
+		fmt.Sprintf("user=%s", *flagDBUser),
+		fmt.Sprintf("dbname=%s", *flagDBName),
+		"sslmode=disable",
+	}
+	if strings.TrimSpace(*flagDBPass) != "" {
+		connParts = append(connParts, fmt.Sprintf("password=%s", *flagDBPass))
+	}
+	connStr := strings.Join(connParts, " ")
 	poolConfig, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
 		log.Fatalf("db config: %v", err)

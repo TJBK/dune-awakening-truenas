@@ -851,6 +851,34 @@ func cmdKickPlayer(playerID int64) tea.Cmd {
 	}
 }
 
+func cmdRepairEquipment(playerID int64) tea.Cmd {
+	return func() tea.Msg {
+		if globalDB == nil {
+			return msgMutate{err: fmt.Errorf("not connected")}
+		}
+		if playerID == 0 {
+			return msgMutate{err: fmt.Errorf("player ID required")}
+		}
+		res, err := globalDB.Exec(context.Background(), `
+			UPDATE dune.items i
+			SET stats = jsonb_set(
+				i.stats,
+				'{FItemStackAndDurabilityStats,1,CurrentDurability}',
+				COALESCE(i.stats #> '{FItemStackAndDurabilityStats,1,MaxDurability}', '1'::jsonb),
+				false
+			)
+			FROM dune.inventories inv
+			WHERE i.inventory_id = inv.id
+			  AND inv.actor_id = $1::bigint
+			  AND i.stats ? 'FItemStackAndDurabilityStats'
+			  AND i.stats #> '{FItemStackAndDurabilityStats,1,CurrentDurability}' IS NOT NULL`, playerID)
+		if err != nil {
+			return msgMutate{err: fmt.Errorf("repair equipment: %w", err)}
+		}
+		return msgMutate{ok: fmt.Sprintf("Repaired %d item(s) for player %d", res.RowsAffected(), playerID)}
+	}
+}
+
 func cmdDeleteItem(itemID int64) tea.Cmd {
 	return func() tea.Msg {
 		if globalDB == nil {

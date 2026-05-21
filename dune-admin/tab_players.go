@@ -32,6 +32,7 @@ const (
 	pvAddPlayerXP
 	pvSetProgression
 	pvUnlockAllSkills
+	pvRepairEquipment
 	pvAwardXP
 	pvSQL
 	pvSQLResult
@@ -95,6 +96,7 @@ var menuItems = []menuItem{
 	{"Add Player XP", pvAddPlayerXP},
 	{"Set Progression", pvSetProgression},
 	{"Unlock All Skills", pvUnlockAllSkills},
+	{"Repair Equipment", pvRepairEquipment},
 	{"Award Spec XP", pvAwardXP},
 	{"Kick Player", pvKickPlayer},
 	{"Delete Item", pvDeleteItem},
@@ -557,6 +559,10 @@ func playersActivateMenu(m model) (model, tea.Cmd) {
 		return playersStartWizard(pvUnlockAllSkills, []inputStep{
 			{prompt: "Player name", hint: "sets all FLevelComponent ModuleData SkillPointsSpent to at least 1"},
 		}, m)
+	case pvRepairEquipment:
+		return playersStartWizard(pvRepairEquipment, []inputStep{
+			{prompt: "Player name", hint: "sets inventory item CurrentDurability to MaxDurability"},
+		}, m)
 	case pvAwardXP:
 		return playersStartWizard(pvAwardXP, []inputStep{
 			{prompt: "Player name", hint: "type name, Tab to autocomplete"},
@@ -600,7 +606,7 @@ func playersStartWizard(target playerView, steps []inputStep, m model) (model, t
 func playersIsInputState(m model) bool {
 	switch m.pl.view {
 	case pvGiveItem, pvGiveCurrency, pvGiveFactionRep, pvGiveLandsraadScrip, pvAwardXP, pvSQL, pvInventory,
-		pvKickPlayer, pvDeleteItem, pvResetSpec, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills:
+		pvKickPlayer, pvDeleteItem, pvResetSpec, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills, pvRepairEquipment:
 		return len(m.pl.inputSteps) > 0 && m.pl.inputCursor < len(m.pl.inputSteps)
 	}
 	return false
@@ -779,6 +785,11 @@ func playersExecuteWizard(m model) (model, tea.Cmd) {
 		m.pl.view = pvMenu
 		return m, cmdUnlockAllSkills(playerID)
 
+	case pvRepairEquipment:
+		playerID := lookupPawnID(vals[0].value)
+		m.pl.view = pvMenu
+		return m, cmdRepairEquipment(playerID)
+
 	case pvAwardXP:
 		playerID := lookupPawnID(vals[0].value)
 		track := strings.TrimSpace(vals[1].value)
@@ -913,7 +924,7 @@ func renderPlayersContentPane(m model, w, h int) string {
 		title = fmt.Sprintf(" Online State (%d players) ", len(m.pl.onlineState))
 		body = m.pl.tbl.View()
 
-	case pvGiveItem, pvGiveCurrency, pvGiveFactionRep, pvGiveLandsraadScrip, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills, pvAwardXP, pvSQL,
+	case pvGiveItem, pvGiveCurrency, pvGiveFactionRep, pvGiveLandsraadScrip, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills, pvRepairEquipment, pvAwardXP, pvSQL,
 		pvKickPlayer, pvResetSpec:
 		if len(m.pl.inputSteps) > 0 && m.pl.inputCursor < len(m.pl.inputSteps) {
 			step := m.pl.inputSteps[m.pl.inputCursor]
@@ -988,6 +999,7 @@ func renderPlayersWelcome(m model, w, h int) string {
 		row("Tech Points", "set unspent research points"),
 		row("Progression", "set XP, skill and tech points"),
 		row("Unlock Skills", "set modules learned"),
+		row("Repair Equip.", "restore item durability"),
 		row("Spec XP", "add specialization-track XP"),
 		row("Kick Player", "sets LoggingOut if DB row exists"),
 		row("SQL", "free-form query / update"),
@@ -1001,7 +1013,7 @@ func renderPlayersWelcome(m model, w, h int) string {
 
 func requiresOfflineReload(v playerView) bool {
 	switch v {
-	case pvGiveItem, pvDeleteItem, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills, pvAwardXP, pvResetSpec:
+	case pvGiveItem, pvDeleteItem, pvSetVitals, pvSetTechPoints, pvSetSkillPoints, pvAddPlayerXP, pvSetProgression, pvUnlockAllSkills, pvRepairEquipment, pvAwardXP, pvResetSpec:
 		return true
 	default:
 		return false
@@ -1208,6 +1220,8 @@ func wizardTitlePV(s playerView) string {
 		return "Set Progression"
 	case pvUnlockAllSkills:
 		return "Unlock All Skills"
+	case pvRepairEquipment:
+		return "Repair Equipment"
 	case pvAwardXP:
 		return "Award XP"
 	case pvSQL:

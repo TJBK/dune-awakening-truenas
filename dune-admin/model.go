@@ -256,7 +256,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = "Connected → AMP local DB"
 			m.statusIsOK = true
 			m.activeTab = tabPlayers
-			return m, tea.Batch(tea.Cmd(cmdFetchPlayers), tea.Cmd(cmdFetchItemTemplates), cmdAutoRefreshTick())
+			m.pl.view = pvMenu
+			return m, tea.Batch(cmdFetchPlayersBackground(), tea.Cmd(cmdFetchItemTemplates), cmdAutoRefreshTick())
 		}
 		return m, nil
 

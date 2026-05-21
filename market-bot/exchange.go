@@ -59,6 +59,7 @@ type listingInfo struct {
 type Exchange struct {
 	db            *pgxpool.Pool
 	cache         *sql.DB // local SQLite category cache
+	dryRun        bool
 	segIdx        [4][]string
 	botInvID      int64
 	ownerID       int64 // actor ID of the market bot (Revy)
@@ -72,6 +73,13 @@ type Exchange struct {
 	nextPos       int64                  // position_index counter for item inserts
 	buyThreshold  float64
 	maxBuys       int
+	lastBuy       time.Time
+	lastList      time.Time
+	totalBought   int64
+	totalCreated  int64
+	totalTopped   int64
+	totalPruned   int64
+	totalErrors   int64
 }
 
 // marketPrice holds real market stats from dune_exchange_get_item_price_stats.
@@ -115,6 +123,19 @@ func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Ex
 	return ex, nil
 }
 
+func (e *Exchange) StatusLine() string {
+	return fmt.Sprintf("status: dryrun=%t bought=%d created=%d topped=%d pruned=%d errors=%d last_buy=%s last_list=%s",
+		e.dryRun, e.totalBought, e.totalCreated, e.totalTopped, e.totalPruned, e.totalErrors,
+		formatStatusTime(e.lastBuy), formatStatusTime(e.lastList))
+}
+
+func formatStatusTime(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.Format(time.RFC3339)
+}
+
 func (e *Exchange) learnGameEpoch(ctx context.Context) {
 	var ref int64
 	err := e.db.QueryRow(ctx, `
@@ -132,8 +153,10 @@ func (e *Exchange) learnGameEpoch(ctx context.Context) {
 		return
 	}
 	e.gameEpochUnix = epoch
-	e.cache.Exec(`INSERT INTO metadata (key, value) VALUES ('game_epoch_unix', ?)
-		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, epoch)
+	if !e.dryRun {
+		e.cache.Exec(`INSERT INTO metadata (key, value) VALUES ('game_epoch_unix', ?)
+			ON CONFLICT (key) DO UPDATE SET value = excluded.value`, epoch)
+	}
 	log.Printf("game epoch learned: unix %d (current game time: %d)", epoch, gameNow)
 }
 
@@ -165,11 +188,15 @@ func (e *Exchange) Init(ctx context.Context, catalog []CatalogItem) error {
 		log.Printf("access point id: %d", e.accessPointID)
 	}
 
-	if err := e.db.QueryRow(ctx,
-		`SELECT dune.get_exchange_inventory_id($1)`, e.exchangeID).Scan(&e.botInvID); err != nil {
-		return fmt.Errorf("exchange inventory: %w", err)
+	if e.dryRun {
+		log.Printf("dry-run: skip exchange inventory lookup/create")
+	} else {
+		if err := e.db.QueryRow(ctx,
+			`SELECT dune.get_exchange_inventory_id($1)`, e.exchangeID).Scan(&e.botInvID); err != nil {
+			return fmt.Errorf("exchange inventory: %w", err)
+		}
+		log.Printf("exchange inventory id: %d", e.botInvID)
 	}
-	log.Printf("exchange inventory id: %d", e.botInvID)
 
 	if err := e.initBotUser(ctx); err != nil {
 		return fmt.Errorf("bot user: %w", err)
@@ -187,15 +214,21 @@ func (e *Exchange) Init(ctx context.Context, catalog []CatalogItem) error {
 	}
 
 	// Start position counter after existing items.
-	e.db.QueryRow(ctx,
-		`SELECT COALESCE(MAX(position_index), -1) + 1 FROM dune.items WHERE inventory_id = $1`,
-		e.botInvID).Scan(&e.nextPos)
+	if !e.dryRun {
+		e.db.QueryRow(ctx,
+			`SELECT COALESCE(MAX(position_index), -1) + 1 FROM dune.items WHERE inventory_id = $1`,
+			e.botInvID).Scan(&e.nextPos)
+	}
 
 	e.learnGameEpoch(ctx)
 	e.refreshCategoryCache(ctx)
 
-	if err := e.poisonCategoryHash(ctx); err != nil {
-		log.Printf("warn: category hash poison: %v", err)
+	if !e.dryRun {
+		if err := e.poisonCategoryHash(ctx); err != nil {
+			log.Printf("warn: category hash poison: %v", err)
+		}
+	} else {
+		log.Printf("dry-run: skip category hash update")
 	}
 	return nil
 }
@@ -204,6 +237,11 @@ func (e *Exchange) initBotUser(ctx context.Context) error {
 	err := e.db.QueryRow(ctx,
 		`SELECT id FROM dune.actors WHERE class = 'Revy' LIMIT 1`).Scan(&e.ownerID)
 	if err == pgx.ErrNoRows {
+		if e.dryRun {
+			log.Printf("dry-run: bot actor Revy does not exist; using owner id 0 for planning")
+			e.ownerID = 0
+			return nil
+		}
 		// Use a valid world partition so the bot actor satisfies the actors FK.
 		var partitionID int64
 		partitionArg := any(nil)
@@ -237,6 +275,10 @@ func (e *Exchange) initBotUser(ctx context.Context) error {
 	_ = e.db.QueryRow(ctx,
 		`SELECT dune.dune_exchange_retrieve_solari_balance($1)`, e.ownerID).Scan(&currentBalance)
 	if currentBalance < seedFloor {
+		if e.dryRun {
+			log.Printf("dry-run: would seed bot balance: %d → %d", currentBalance, seedAmount)
+			return nil
+		}
 		_, err = e.db.Exec(ctx,
 			`SELECT dune.dune_exchange_modify_user_solari_balance($1, $2)`,
 			e.ownerID, seedAmount-currentBalance) // top up to 9T
@@ -305,15 +347,17 @@ func (e *Exchange) refreshCategoryCache(ctx context.Context) {
 		}
 	}
 
-	for _, en := range toWrite {
-		if _, err := e.cache.Exec(`
-			INSERT INTO categories (template_id, category_mask, category_depth)
-			VALUES (?, ?, ?)
-			ON CONFLICT (template_id) DO UPDATE
-			  SET category_mask  = excluded.category_mask,
-			      category_depth = excluded.category_depth`,
-			en.tmpl, en.mask, en.depth); err != nil {
-			log.Printf("warn: persist category %s: %v", en.tmpl, err)
+	if !e.dryRun {
+		for _, en := range toWrite {
+			if _, err := e.cache.Exec(`
+				INSERT INTO categories (template_id, category_mask, category_depth)
+				VALUES (?, ?, ?)
+				ON CONFLICT (template_id) DO UPDATE
+				  SET category_mask  = excluded.category_mask,
+				      category_depth = excluded.category_depth`,
+				en.tmpl, en.mask, en.depth); err != nil {
+				log.Printf("warn: persist category %s: %v", en.tmpl, err)
+			}
 		}
 	}
 
@@ -401,6 +445,11 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 		}
 
 		totalCost := price * stackSize
+		if e.dryRun {
+			log.Printf("dry-run buy: would buy order=%d item=%s grade=%d stack=%d price=%d total=%d seller=%d", orderID, tmpl, grade, stackSize, price, totalCost, sellerActorID)
+			purchased++
+			continue
+		}
 
 		tx, err := e.db.Begin(ctx)
 		if err != nil {
@@ -469,9 +518,15 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 	}
 
 	if purchased+errs+skippedPrice+skippedUnknown > 0 {
-		log.Printf("buy: %d purchased, %d skipped-price, %d skipped-unknown, %d errors",
-			purchased, skippedPrice, skippedUnknown, errs)
+		verb := "purchased"
+		if e.dryRun {
+			verb = "would-purchase"
+		}
+		log.Printf("buy: %d %s, %d skipped-price, %d skipped-unknown, %d errors",
+			purchased, verb, skippedPrice, skippedUnknown, errs)
 	}
+	e.totalBought += int64(purchased)
+	e.totalErrors += int64(errs)
 }
 
 // pendingListing holds the data needed to batch-insert a new bot listing.
@@ -486,6 +541,20 @@ type pendingListing struct {
 // createListingsBatch inserts up to batchSize listings per transaction.
 // Returns (created, errors).
 func (e *Exchange) createListingsBatch(ctx context.Context, listings []pendingListing) (int, int) {
+	if e.dryRun {
+		for i, pl := range listings {
+			if i >= 20 {
+				log.Printf("dry-run list: ... %d more listings", len(listings)-i)
+				break
+			}
+			price := gradeFloor(pl.item, pl.grade)
+			if pl.item.MaterialCost <= 0 {
+				price = gradedPrice(pl.basePrice, pl.grade)
+			}
+			log.Printf("dry-run list: would create %s grade=%d stack=%d price=%d", pl.item.TemplateID, pl.grade, pl.stackMax, price)
+		}
+		return len(listings), 0
+	}
 	const batchSize = 100
 	created, errs := 0, 0
 	for i := 0; i < len(listings); i += batchSize {
@@ -605,6 +674,7 @@ func (e *Exchange) createListing(ctx context.Context, item CatalogItem, basePric
 
 // BuyTick runs the buy-side operations: learn game epoch and purchase player listings.
 func (e *Exchange) BuyTick(ctx context.Context) {
+	e.lastBuy = time.Now()
 	e.learnGameEpoch(ctx)
 
 	gameNow := e.gameNow()
@@ -621,6 +691,7 @@ func (e *Exchange) BuyTick(ctx context.Context) {
 // ListTick runs the listing/pruning operations: refresh caches, update prices,
 // prune stale listings, top up depleted stacks, and create new listings.
 func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
+	e.lastList = time.Now()
 	e.learnGameEpoch(ctx)
 	e.refreshCategoryCache(ctx)
 	e.fetchMarketPrices(ctx, catalog) // fetch real market prices via proc
@@ -721,8 +792,12 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 
 	// Bulk delete stale orders and their items.
 	if len(staleOrderIDs) > 0 {
-		e.db.Exec(ctx, `DELETE FROM dune.dune_exchange_orders WHERE id = ANY($1)`, staleOrderIDs)
-		e.db.Exec(ctx, `DELETE FROM dune.items WHERE id = ANY($1)`, staleItemIDs)
+		if e.dryRun {
+			log.Printf("dry-run list: would prune %d stale listings", len(staleOrderIDs))
+		} else {
+			e.db.Exec(ctx, `DELETE FROM dune.dune_exchange_orders WHERE id = ANY($1)`, staleOrderIDs)
+			e.db.Exec(ctx, `DELETE FROM dune.items WHERE id = ANY($1)`, staleItemIDs)
+		}
 	}
 
 	// Bulk update depleted stacks.
@@ -733,10 +808,14 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 			ids[i] = t.itemID
 			sizes[i] = t.stackMax
 		}
-		e.db.Exec(ctx, `
-			UPDATE dune.items SET stack_size = u.s
-			FROM unnest($1::bigint[], $2::bigint[]) AS u(id, s)
-			WHERE dune.items.id = u.id`, ids, sizes)
+		if e.dryRun {
+			log.Printf("dry-run list: would top up %d depleted stacks", len(topUps))
+		} else {
+			e.db.Exec(ctx, `
+				UPDATE dune.items SET stack_size = u.s
+				FROM unnest($1::bigint[], $2::bigint[]) AS u(id, s)
+				WHERE dune.items.id = u.id`, ids, sizes)
+		}
 	}
 
 	// Batch insert new listings.
@@ -746,7 +825,15 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 		errs += e2
 	}
 
-	log.Printf("list-tick: %d created, %d topped up, %d pruned, %d errors", created, topped, pruned, errs)
+	verb := "created"
+	if e.dryRun {
+		verb = "would-create"
+	}
+	log.Printf("list-tick: %d %s, %d topped up, %d pruned, %d errors", created, verb, topped, pruned, errs)
+	e.totalCreated += int64(created)
+	e.totalTopped += int64(topped)
+	e.totalPruned += int64(pruned)
+	e.totalErrors += int64(errs)
 }
 
 // Tick runs both BuyTick and ListTick. Used for the initial run on startup.
@@ -850,6 +937,10 @@ func (e *Exchange) fetchMarketPrices(ctx context.Context, catalog []CatalogItem)
 
 // expireAndPurgeOrders uses server procs to expire and purge old orders.
 func (e *Exchange) expireAndPurgeOrders(ctx context.Context) {
+	if e.dryRun {
+		log.Printf("dry-run: skip expire/purge procedures")
+		return
+	}
 	now := e.gameNow()
 	if now <= 0 {
 		return // game epoch not learned yet

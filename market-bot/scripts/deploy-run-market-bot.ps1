@@ -11,7 +11,9 @@ param(
     [string]$BuyInterval = "5m",
     [string]$ListInterval = "30m",
     [double]$BuyThreshold = 1.05,
-    [int]$MaxBuys = 50
+    [int]$MaxBuys = 50,
+    [switch]$DryRun,
+    [string]$StatusInterval = "1m"
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,5 +55,6 @@ Write-Host "Uploading item data to ${Remote}:$RemoteItemData ..." -ForegroundCol
 scp $ItemData "${Remote}:$RemoteItemData"
 
 Write-Host "Starting market bot on server (live update mode, not report mode)..." -ForegroundColor Cyan
-$remoteCommand = "chmod +x $RemotePath && TERM=xterm-256color $RemotePath -mode amp -report=false -dbuser '$DbUser' -dbpass '$DbPass' -dbname '$DbName' -dbport $DbPort -itemdata '$RemoteItemData' -cachedb '$CacheDb' -buyinterval '$BuyInterval' -listinterval '$ListInterval' -buythreshold $BuyThreshold -maxbuys $MaxBuys"
+$dryRunArg = if ($DryRun) { " -dryrun" } else { "" }
+$remoteCommand = "chmod +x $RemotePath && TERM=xterm-256color $RemotePath -mode amp -report=false$dryRunArg -dbuser '$DbUser' -dbpass '$DbPass' -dbname '$DbName' -dbport $DbPort -itemdata '$RemoteItemData' -cachedb '$CacheDb' -buyinterval '$BuyInterval' -listinterval '$ListInterval' -buythreshold $BuyThreshold -maxbuys $MaxBuys -statusinterval '$StatusInterval'"
 ssh -t $Remote $remoteCommand

@@ -16,18 +16,20 @@ import (
 )
 
 var (
-	flagMode         = flag.String("mode", "k3s", "runtime mode: k3s or amp")
-	flagDBHost       = flag.String("dbhost", "", "PostgreSQL host")
-	flagDBPort       = flag.Int("dbport", 15432, "PostgreSQL port")
-	flagDBUser       = flag.String("dbuser", "dune", "PostgreSQL user")
-	flagDBPass       = flag.String("dbpass", "", "PostgreSQL password")
-	flagDBName       = flag.String("dbname", "dune", "PostgreSQL database")
-	flagCacheDB      = flag.String("cachedb", "/data/market-bot-cache.db", "SQLite path for category cache")
-	flagBuyInterval  = flag.Duration("buyinterval", 5*time.Minute, "how often to buy player listings")
-	flagListInterval = flag.Duration("listinterval", 30*time.Minute, "how often to restock/prune bot listings")
-	flagBuyThreshold = flag.Float64("buythreshold", 1.05, "buy player listings at or below this multiple of the bot's sell price (0 = disable buying)")
-	flagMaxBuys      = flag.Int("maxbuys", 50, "max player listings to purchase per tick")
-	flagReport       = flag.Bool("report", false, "print per-item sales analytics as TSV and exit (does not run the bot loop)")
+	flagMode           = flag.String("mode", "k3s", "runtime mode: k3s or amp")
+	flagDBHost         = flag.String("dbhost", "", "PostgreSQL host")
+	flagDBPort         = flag.Int("dbport", 15432, "PostgreSQL port")
+	flagDBUser         = flag.String("dbuser", "dune", "PostgreSQL user")
+	flagDBPass         = flag.String("dbpass", "", "PostgreSQL password")
+	flagDBName         = flag.String("dbname", "dune", "PostgreSQL database")
+	flagCacheDB        = flag.String("cachedb", "/data/market-bot-cache.db", "SQLite path for category cache")
+	flagBuyInterval    = flag.Duration("buyinterval", 5*time.Minute, "how often to buy player listings")
+	flagListInterval   = flag.Duration("listinterval", 30*time.Minute, "how often to restock/prune bot listings")
+	flagBuyThreshold   = flag.Float64("buythreshold", 1.05, "buy player listings at or below this multiple of the bot's sell price (0 = disable buying)")
+	flagMaxBuys        = flag.Int("maxbuys", 50, "max player listings to purchase per tick")
+	flagReport         = flag.Bool("report", false, "print per-item sales analytics as TSV and exit (does not run the bot loop)")
+	flagDryRun         = flag.Bool("dryrun", false, "plan buys/listings without writing market changes")
+	flagStatusInterval = flag.Duration("statusinterval", 1*time.Minute, "how often to print live bot status (0 = disable)")
 )
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -112,6 +114,10 @@ func main() {
 	}
 	ex.buyThreshold = *flagBuyThreshold
 	ex.maxBuys = *flagMaxBuys
+	ex.dryRun = *flagDryRun
+	if ex.dryRun {
+		log.Println("DRY RUN enabled: market changes will be logged but not written")
+	}
 
 	log.Println("initializing exchange...")
 	if err := ex.Init(ctx, catalog); err != nil {
@@ -130,6 +136,13 @@ func main() {
 
 	tick := time.NewTicker(minDuration(*flagBuyInterval, *flagListInterval))
 	defer tick.Stop()
+	var statusTick *time.Ticker
+	var statusC <-chan time.Time
+	if *flagStatusInterval > 0 {
+		statusTick = time.NewTicker(*flagStatusInterval)
+		defer statusTick.Stop()
+		statusC = statusTick.C
+	}
 	nextBuy := time.Now().Add(*flagBuyInterval)
 	nextList := time.Now().Add(*flagListInterval)
 	for {
@@ -137,6 +150,8 @@ func main() {
 		case <-ctx.Done():
 			log.Println("shutting down (signal received)")
 			return
+		case <-statusC:
+			log.Println(ex.StatusLine())
 		case now := <-tick.C:
 			if now.After(nextBuy) {
 				ex.BuyTick(ctx)

@@ -30,6 +30,7 @@ var (
 	flagReport         = flag.Bool("report", false, "print per-item sales analytics as TSV and exit (does not run the bot loop)")
 	flagDryRun         = flag.Bool("dryrun", false, "plan buys/listings without writing market changes")
 	flagStatusInterval = flag.Duration("statusinterval", 1*time.Minute, "how often to print live bot status (0 = disable)")
+	flagUI             = flag.Bool("ui", true, "show live terminal dashboard while running")
 )
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -108,6 +109,13 @@ func main() {
 	}
 	log.Printf("catalog: %d listable items", len(catalog))
 
+	var ui *marketUI
+	if *flagUI && !*flagReport {
+		ui = newMarketUI(mode, fmt.Sprintf("%s:%d/%s", *flagDBHost, *flagDBPort, *flagDBName), len(catalog), *flagDryRun, *flagBuyInterval, *flagListInterval)
+		log.SetOutput(ui)
+		defer ui.Close()
+	}
+
 	ex, err := NewExchange(pool, *flagCacheDB, catalog)
 	if err != nil {
 		log.Fatalf("init exchange: %v", err)
@@ -145,13 +153,22 @@ func main() {
 	}
 	nextBuy := time.Now().Add(*flagBuyInterval)
 	nextList := time.Now().Add(*flagListInterval)
+	if ui != nil {
+		ui.Render(ex, nextBuy, nextList)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("shutting down (signal received)")
+			if ui != nil {
+				ui.Render(ex, nextBuy, nextList)
+			}
 			return
 		case <-statusC:
 			log.Println(ex.StatusLine())
+			if ui != nil {
+				ui.Render(ex, nextBuy, nextList)
+			}
 		case now := <-tick.C:
 			if now.After(nextBuy) {
 				ex.BuyTick(ctx)
@@ -160,6 +177,9 @@ func main() {
 			if now.After(nextList) {
 				ex.ListTick(ctx, catalog)
 				nextList = now.Add(*flagListInterval)
+			}
+			if ui != nil {
+				ui.Render(ex, nextBuy, nextList)
 			}
 		}
 	}

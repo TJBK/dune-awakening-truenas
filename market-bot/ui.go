@@ -61,7 +61,7 @@ func (ui *marketUI) Render(ex *Exchange, nextBuy, nextList time.Time) {
 	fmt.Fprintln(ui.out, "╭──────────────────────────────────────────────╮")
 	fmt.Fprintln(ui.out, "│ Dune Awakening Market Bot                    │")
 	fmt.Fprintln(ui.out, "╰──────────────────────────────────────────────╯")
-	fmt.Fprintf(ui.out, " Mode: %-8s  Dry-run: %-5t  Uptime: %s\n", ui.mode, ui.dryRun, shortDuration(time.Since(ui.started)))
+	fmt.Fprintf(ui.out, " Mode: %-8s  Dry-run: %-5t  Paused: %-5t  Uptime: %s\n", ui.mode, ui.dryRun, ex.paused, shortDuration(time.Since(ui.started)))
 	fmt.Fprintf(ui.out, " DB: %s\n", ui.db)
 	fmt.Fprintf(ui.out, " Catalog: %d items\n", ui.catalogN)
 	fmt.Fprintf(ui.out, " Buy every: %-8s  Next buy:  %s\n", ui.buyEvery, formatCountdown(nextBuy))
@@ -69,8 +69,8 @@ func (ui *marketUI) Render(ex *Exchange, nextBuy, nextList time.Time) {
 	fmt.Fprintln(ui.out)
 	fmt.Fprintln(ui.out, " Stats")
 	fmt.Fprintln(ui.out, " ─────")
-	fmt.Fprintf(ui.out, " Bought: %-8d Created: %-8d Topped: %-8d Pruned: %-8d Errors: %-8d\n",
-		ex.totalBought, ex.totalCreated, ex.totalTopped, ex.totalPruned, ex.totalErrors)
+	fmt.Fprintf(ui.out, " Bought: %-8d Spent: %-12d Created: %-8d Topped: %-8d Pruned: %-8d Errors: %-8d\n",
+		ex.totalBought, ex.totalSpent, ex.totalCreated, ex.totalTopped, ex.totalPruned, ex.totalErrors)
 	fmt.Fprintf(ui.out, " Last buy:  %s\n", formatStatusTime(ex.lastBuy))
 	fmt.Fprintf(ui.out, " Last list: %s\n", formatStatusTime(ex.lastList))
 	fmt.Fprintln(ui.out)
@@ -84,6 +84,7 @@ func (ui *marketUI) Render(ex *Exchange, nextBuy, nextList time.Time) {
 		}
 	}
 	fmt.Fprintln(ui.out)
+	fmt.Fprintln(ui.out, " Commands then Enter: p pause  b buy  l list  r run  q quit  h help")
 	fmt.Fprintln(ui.out, " Ctrl+C quit   -dryrun previews without DB writes   -ui=false disables this screen")
 }
 

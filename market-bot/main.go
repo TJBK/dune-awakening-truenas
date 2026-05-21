@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -31,6 +32,9 @@ var (
 	flagDryRun         = flag.Bool("dryrun", false, "plan buys/listings without writing market changes")
 	flagStatusInterval = flag.Duration("statusinterval", 1*time.Minute, "how often to print live bot status (0 = disable)")
 	flagUI             = flag.Bool("ui", true, "show live terminal dashboard while running")
+	flagLogFile        = flag.String("logfile", "", "also write logs to this file")
+	flagMaxSpend       = flag.Int64("maxspend", 0, "max Solaris the bot may spend buying player listings per tick (0 = unlimited)")
+	flagMaxListings    = flag.Int("maxlistings", 0, "max new bot listings to create per list tick (0 = unlimited)")
 )
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -66,6 +70,15 @@ func main() {
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("market-bot ")
+	var logFile *os.File
+	if strings.TrimSpace(*flagLogFile) != "" {
+		logFile, err := os.OpenFile(*flagLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Fatalf("open logfile: %v", err)
+		}
+		defer logFile.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+	}
 	log.Printf("mode: %s", mode)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -112,7 +125,11 @@ func main() {
 	var ui *marketUI
 	if *flagUI && !*flagReport {
 		ui = newMarketUI(mode, fmt.Sprintf("%s:%d/%s", *flagDBHost, *flagDBPort, *flagDBName), len(catalog), *flagDryRun, *flagBuyInterval, *flagListInterval)
-		log.SetOutput(ui)
+		if logFile != nil {
+			log.SetOutput(io.MultiWriter(ui, logFile))
+		} else {
+			log.SetOutput(ui)
+		}
 		defer ui.Close()
 	}
 
@@ -122,6 +139,8 @@ func main() {
 	}
 	ex.buyThreshold = *flagBuyThreshold
 	ex.maxBuys = *flagMaxBuys
+	ex.maxSpendPerTick = *flagMaxSpend
+	ex.maxListingsPerTick = *flagMaxListings
 	ex.dryRun = *flagDryRun
 	if ex.dryRun {
 		log.Println("DRY RUN enabled: market changes will be logged but not written")
@@ -153,6 +172,7 @@ func main() {
 	}
 	nextBuy := time.Now().Add(*flagBuyInterval)
 	nextList := time.Now().Add(*flagListInterval)
+	commands := readCommands(ctx)
 	if ui != nil {
 		ui.Render(ex, nextBuy, nextList)
 	}
@@ -164,12 +184,51 @@ func main() {
 				ui.Render(ex, nextBuy, nextList)
 			}
 			return
+		case cmd, ok := <-commands:
+			if !ok {
+				commands = nil
+				continue
+			}
+			switch cmd {
+			case "p", "pause":
+				ex.paused = !ex.paused
+				log.Printf("paused=%t", ex.paused)
+			case "b", "buy":
+				log.Println("manual buy tick")
+				ex.BuyTick(ctx)
+				nextBuy = time.Now().Add(*flagBuyInterval)
+			case "l", "list":
+				log.Println("manual list tick")
+				ex.ListTick(ctx, catalog)
+				nextList = time.Now().Add(*flagListInterval)
+			case "r", "run":
+				log.Println("manual full tick")
+				ex.Tick(ctx, catalog)
+				nextBuy = time.Now().Add(*flagBuyInterval)
+				nextList = time.Now().Add(*flagListInterval)
+			case "q", "quit":
+				log.Println("quit requested")
+				return
+			case "h", "help", "?":
+				log.Println("commands: p=pause/resume b=buy l=list r=full tick q=quit h=help")
+			default:
+				log.Printf("unknown command %q (h for help)", cmd)
+			}
+			if ui != nil {
+				ui.Render(ex, nextBuy, nextList)
+			}
 		case <-statusC:
 			log.Println(ex.StatusLine())
 			if ui != nil {
 				ui.Render(ex, nextBuy, nextList)
 			}
 		case now := <-tick.C:
+			if ex.paused {
+				if ui != nil {
+					ui.Render(ex, nextBuy, nextList)
+				}
+				continue
+			}
 			if now.After(nextBuy) {
 				ex.BuyTick(ctx)
 				nextBuy = now.Add(*flagBuyInterval)

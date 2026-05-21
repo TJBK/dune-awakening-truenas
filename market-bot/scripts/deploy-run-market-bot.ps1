@@ -12,6 +12,8 @@ param(
     [string]$ListInterval = "30m",
     [double]$BuyThreshold = 1.05,
     [int]$MaxBuys = 50,
+    [int64]$MaxSpend = 0,
+    [int]$MaxListings = 0,
     [switch]$DryRun,
     [string]$StatusInterval = "10s",
     [switch]$NoUI
@@ -58,5 +60,5 @@ scp $ItemData "${Remote}:$RemoteItemData"
 Write-Host "Starting market bot on server (live update mode, not report mode)..." -ForegroundColor Cyan
 $dryRunArg = if ($DryRun) { " -dryrun" } else { "" }
 $uiArg = if ($NoUI) { " -ui=false" } else { " -ui=true" }
-$remoteCommand = "chmod +x $RemotePath && TERM=xterm-256color $RemotePath -mode amp -report=false$dryRunArg$uiArg -dbuser '$DbUser' -dbpass '$DbPass' -dbname '$DbName' -dbport $DbPort -itemdata '$RemoteItemData' -cachedb '$CacheDb' -buyinterval '$BuyInterval' -listinterval '$ListInterval' -buythreshold $BuyThreshold -maxbuys $MaxBuys -statusinterval '$StatusInterval'"
+$remoteCommand = "chmod +x $RemotePath && TERM=xterm-256color $RemotePath -mode amp -report=false$dryRunArg$uiArg -dbuser '$DbUser' -dbpass '$DbPass' -dbname '$DbName' -dbport $DbPort -itemdata '$RemoteItemData' -cachedb '$CacheDb' -buyinterval '$BuyInterval' -listinterval '$ListInterval' -buythreshold $BuyThreshold -maxbuys $MaxBuys -maxspend $MaxSpend -maxlistings $MaxListings -statusinterval '$StatusInterval'"
 ssh -t $Remote $remoteCommand

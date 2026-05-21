@@ -57,29 +57,33 @@ type listingInfo struct {
 }
 
 type Exchange struct {
-	db            *pgxpool.Pool
-	cache         *sql.DB // local SQLite category cache
-	dryRun        bool
-	segIdx        [4][]string
-	botInvID      int64
-	ownerID       int64 // actor ID of the market bot (Revy)
-	exchangeID    int64
-	accessPointID int64
-	prices        map[string]int64
-	marketPrices  map[string]marketPrice // real market prices from dune_exchange_get_item_price_stats
-	categories    map[string]categoryEntry
-	catalogMap    map[string]CatalogItem // template_id → catalog entry (for buyable check)
-	gameEpochUnix int64                  // unix timestamp of the game server's time epoch; 0 = unknown
-	nextPos       int64                  // position_index counter for item inserts
-	buyThreshold  float64
-	maxBuys       int
-	lastBuy       time.Time
-	lastList      time.Time
-	totalBought   int64
-	totalCreated  int64
-	totalTopped   int64
-	totalPruned   int64
-	totalErrors   int64
+	db                 *pgxpool.Pool
+	cache              *sql.DB // local SQLite category cache
+	dryRun             bool
+	segIdx             [4][]string
+	botInvID           int64
+	ownerID            int64 // actor ID of the market bot (Revy)
+	exchangeID         int64
+	accessPointID      int64
+	prices             map[string]int64
+	marketPrices       map[string]marketPrice // real market prices from dune_exchange_get_item_price_stats
+	categories         map[string]categoryEntry
+	catalogMap         map[string]CatalogItem // template_id → catalog entry (for buyable check)
+	gameEpochUnix      int64                  // unix timestamp of the game server's time epoch; 0 = unknown
+	nextPos            int64                  // position_index counter for item inserts
+	buyThreshold       float64
+	maxBuys            int
+	maxSpendPerTick    int64
+	maxListingsPerTick int
+	paused             bool
+	lastBuy            time.Time
+	lastList           time.Time
+	totalBought        int64
+	totalSpent         int64
+	totalCreated       int64
+	totalTopped        int64
+	totalPruned        int64
+	totalErrors        int64
 }
 
 // marketPrice holds real market stats from dune_exchange_get_item_price_stats.
@@ -124,8 +128,8 @@ func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Ex
 }
 
 func (e *Exchange) StatusLine() string {
-	return fmt.Sprintf("status: dryrun=%t bought=%d created=%d topped=%d pruned=%d errors=%d last_buy=%s last_list=%s",
-		e.dryRun, e.totalBought, e.totalCreated, e.totalTopped, e.totalPruned, e.totalErrors,
+	return fmt.Sprintf("status: dryrun=%t paused=%t bought=%d spent=%d created=%d topped=%d pruned=%d errors=%d last_buy=%s last_list=%s",
+		e.dryRun, e.paused, e.totalBought, e.totalSpent, e.totalCreated, e.totalTopped, e.totalPruned, e.totalErrors,
 		formatStatusTime(e.lastBuy), formatStatusTime(e.lastList))
 }
 
@@ -411,7 +415,8 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 	}
 	defer rows.Close()
 
-	purchased, skippedPrice, skippedUnknown, errs := 0, 0, 0, 0
+	purchased, skippedPrice, skippedUnknown, skippedSpend, errs := 0, 0, 0, 0, 0
+	var spent int64
 
 	for rows.Next() {
 		if purchased >= e.maxBuys {
@@ -445,9 +450,15 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 		}
 
 		totalCost := price * stackSize
+		if e.maxSpendPerTick > 0 && spent+totalCost > e.maxSpendPerTick {
+			log.Printf("buy: skip %s total=%d would exceed maxspend=%d spent=%d", tmpl, totalCost, e.maxSpendPerTick, spent)
+			skippedSpend++
+			continue
+		}
 		if e.dryRun {
 			log.Printf("dry-run buy: would buy order=%d item=%s grade=%d stack=%d price=%d total=%d seller=%d", orderID, tmpl, grade, stackSize, price, totalCost, sellerActorID)
 			purchased++
+			spent += totalCost
 			continue
 		}
 
@@ -515,17 +526,19 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 			continue
 		}
 		purchased++
+		spent += totalCost
 	}
 
-	if purchased+errs+skippedPrice+skippedUnknown > 0 {
+	if purchased+errs+skippedPrice+skippedUnknown+skippedSpend > 0 {
 		verb := "purchased"
 		if e.dryRun {
 			verb = "would-purchase"
 		}
-		log.Printf("buy: %d %s, %d skipped-price, %d skipped-unknown, %d errors",
-			purchased, verb, skippedPrice, skippedUnknown, errs)
+		log.Printf("buy: %d %s, spent=%d, %d skipped-price, %d skipped-unknown, %d skipped-spend, %d errors",
+			purchased, verb, spent, skippedPrice, skippedUnknown, skippedSpend, errs)
 	}
 	e.totalBought += int64(purchased)
+	e.totalSpent += spent
 	e.totalErrors += int64(errs)
 }
 
@@ -819,6 +832,10 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 	}
 
 	// Batch insert new listings.
+	if e.maxListingsPerTick > 0 && len(pending) > e.maxListingsPerTick {
+		log.Printf("list-tick: limiting new listings %d → %d", len(pending), e.maxListingsPerTick)
+		pending = pending[:e.maxListingsPerTick]
+	}
 	if len(pending) > 0 {
 		c, e2 := e.createListingsBatch(ctx, pending)
 		created += c

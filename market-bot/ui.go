@@ -2,96 +2,242 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"os"
 	"strings"
-	"sync"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-type marketUI struct {
-	mu        sync.Mutex
-	out       io.Writer
+type uiSnapshot struct {
 	mode      string
 	db        string
 	catalogN  int
 	dryRun    bool
+	paused    bool
 	buyEvery  time.Duration
 	listEvery time.Duration
 	started   time.Time
-	logs      []string
-	maxLogs   int
+	nextBuy   time.Time
+	nextList  time.Time
+
+	bought  int64
+	spent   int64
+	created int64
+	topped  int64
+	pruned  int64
+	errors  int64
+	lastBuy time.Time
+	lastLst time.Time
+}
+
+type uiLogMsg string
+type uiSnapshotMsg uiSnapshot
+
+type marketUI struct {
+	program *tea.Program
+	cmds    chan string
+	base    uiSnapshot
 }
 
 func newMarketUI(mode, db string, catalogN int, dryRun bool, buyEvery, listEvery time.Duration) *marketUI {
-	return &marketUI{
-		out:       os.Stdout,
-		mode:      mode,
-		db:        db,
-		catalogN:  catalogN,
-		dryRun:    dryRun,
-		buyEvery:  buyEvery,
-		listEvery: listEvery,
-		started:   time.Now(),
-		maxLogs:   12,
+	ui := &marketUI{
+		cmds: make(chan string, 8),
+		base: uiSnapshot{mode: mode, db: db, catalogN: catalogN, dryRun: dryRun, buyEvery: buyEvery, listEvery: listEvery, started: time.Now()},
 	}
+	m := marketUIModel{cmds: ui.cmds, snap: ui.base, tab: 0, maxLogs: 14}
+	ui.program = tea.NewProgram(m, tea.WithAltScreen())
+	go func() {
+		_, _ = ui.program.Run()
+	}()
+	return ui
 }
 
+func (ui *marketUI) Commands() <-chan string { return ui.cmds }
+
 func (ui *marketUI) Write(p []byte) (int, error) {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
 	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		ui.logs = append(ui.logs, line)
-		if len(ui.logs) > ui.maxLogs {
-			ui.logs = ui.logs[len(ui.logs)-ui.maxLogs:]
+		if line != "" && ui.program != nil {
+			ui.program.Send(uiLogMsg(line))
 		}
 	}
 	return len(p), nil
 }
 
 func (ui *marketUI) Render(ex *Exchange, nextBuy, nextList time.Time) {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-
-	fmt.Fprint(ui.out, "\033[2J\033[H")
-	fmt.Fprintln(ui.out, "╭──────────────────────────────────────────────╮")
-	fmt.Fprintln(ui.out, "│ Dune Awakening Market Bot                    │")
-	fmt.Fprintln(ui.out, "╰──────────────────────────────────────────────╯")
-	fmt.Fprintf(ui.out, " Mode: %-8s  Dry-run: %-5t  Paused: %-5t  Uptime: %s\n", ui.mode, ui.dryRun, ex.paused, shortDuration(time.Since(ui.started)))
-	fmt.Fprintf(ui.out, " DB: %s\n", ui.db)
-	fmt.Fprintf(ui.out, " Catalog: %d items\n", ui.catalogN)
-	fmt.Fprintf(ui.out, " Buy every: %-8s  Next buy:  %s\n", ui.buyEvery, formatCountdown(nextBuy))
-	fmt.Fprintf(ui.out, " List every: %-7s  Next list: %s\n", ui.listEvery, formatCountdown(nextList))
-	fmt.Fprintln(ui.out)
-	fmt.Fprintln(ui.out, " Stats")
-	fmt.Fprintln(ui.out, " ─────")
-	fmt.Fprintf(ui.out, " Bought: %-8d Spent: %-12d Created: %-8d Topped: %-8d Pruned: %-8d Errors: %-8d\n",
-		ex.totalBought, ex.totalSpent, ex.totalCreated, ex.totalTopped, ex.totalPruned, ex.totalErrors)
-	fmt.Fprintf(ui.out, " Last buy:  %s\n", formatStatusTime(ex.lastBuy))
-	fmt.Fprintf(ui.out, " Last list: %s\n", formatStatusTime(ex.lastList))
-	fmt.Fprintln(ui.out)
-	fmt.Fprintln(ui.out, " Recent log")
-	fmt.Fprintln(ui.out, " ──────────")
-	if len(ui.logs) == 0 {
-		fmt.Fprintln(ui.out, " (no log lines yet)")
-	} else {
-		for _, line := range ui.logs {
-			fmt.Fprintf(ui.out, " %s\n", trimRunes(line, 120))
-		}
+	if ui.program == nil {
+		return
 	}
-	fmt.Fprintln(ui.out)
-	fmt.Fprintln(ui.out, " Commands then Enter: p pause  b buy  l list  r run  q quit  h help")
-	fmt.Fprintln(ui.out, " Ctrl+C quit   -dryrun previews without DB writes   -ui=false disables this screen")
+	s := ui.base
+	s.nextBuy = nextBuy
+	s.nextList = nextList
+	s.paused = ex.paused
+	s.bought = ex.totalBought
+	s.spent = ex.totalSpent
+	s.created = ex.totalCreated
+	s.topped = ex.totalTopped
+	s.pruned = ex.totalPruned
+	s.errors = ex.totalErrors
+	s.lastBuy = ex.lastBuy
+	s.lastLst = ex.lastList
+	ui.program.Send(uiSnapshotMsg(s))
 }
 
 func (ui *marketUI) Close() {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-	fmt.Fprint(ui.out, "\033[0m\n")
+	if ui.program != nil {
+		ui.program.Quit()
+	}
+}
+
+type marketUIModel struct {
+	cmds    chan<- string
+	snap    uiSnapshot
+	logs    []string
+	maxLogs int
+	tab     int
+	w       int
+	h       int
+}
+
+var (
+	uiOrange = lipgloss.Color("#FFB000")
+	uiGreen  = lipgloss.Color("#44FF88")
+	uiRed    = lipgloss.Color("#FF5555")
+	uiDim    = lipgloss.Color("#777777")
+	uiPanel  = lipgloss.Color("#242424")
+
+	uiTitle = lipgloss.NewStyle().Bold(true).Foreground(uiOrange)
+	uiOK    = lipgloss.NewStyle().Bold(true).Foreground(uiGreen)
+	uiBad   = lipgloss.NewStyle().Bold(true).Foreground(uiRed)
+	uiHelp  = lipgloss.NewStyle().Foreground(uiDim)
+	uiBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(uiDim).Padding(0, 1)
+)
+
+func (m marketUIModel) Init() tea.Cmd { return nil }
+
+func (m marketUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+	case uiLogMsg:
+		m.logs = append(m.logs, string(msg))
+		if len(m.logs) > m.maxLogs {
+			m.logs = m.logs[len(m.logs)-m.maxLogs:]
+		}
+	case uiSnapshotMsg:
+		m.snap = uiSnapshot(msg)
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.send("q")
+			return m, tea.Quit
+		case "tab", "right", "l":
+			m.tab = (m.tab + 1) % 3
+		case "shift+tab", "left", "h":
+			m.tab = (m.tab + 2) % 3
+		case "p":
+			m.send("p")
+		case "b":
+			m.send("b")
+		case "n":
+			m.send("l")
+		case "r":
+			m.send("r")
+		case "?":
+			m.send("h")
+		}
+	}
+	return m, nil
+}
+
+func (m marketUIModel) send(cmd string) {
+	select {
+	case m.cmds <- cmd:
+	default:
+	}
+}
+
+func (m marketUIModel) View() string {
+	if m.w == 0 {
+		return "Loading market bot…"
+	}
+	bodyW := m.w - 4
+	if bodyW < 60 {
+		bodyW = 60
+	}
+	var body string
+	switch m.tab {
+	case 1:
+		body = m.viewActivity(bodyW)
+	case 2:
+		body = m.viewConfig(bodyW)
+	default:
+		body = m.viewOverview(bodyW)
+	}
+	header := uiTitle.Render("Dune Awakening Market Bot") + "  " + m.tabs()
+	footer := uiHelp.Render("p pause  b buy now  n list now  r full tick  tab switch  q quit")
+	return header + "\n" + body + "\n" + footer
+}
+
+func (m marketUIModel) tabs() string {
+	labels := []string{"Overview", "Activity", "Config"}
+	out := make([]string, len(labels))
+	for i, l := range labels {
+		if i == m.tab {
+			out[i] = uiOK.Render("[" + l + "]")
+		} else {
+			out[i] = uiHelp.Render(" " + l + " ")
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+func (m marketUIModel) viewOverview(w int) string {
+	state := uiOK.Render("RUNNING")
+	if m.snap.paused {
+		state = uiBad.Render("PAUSED")
+	}
+	dry := "false"
+	if m.snap.dryRun {
+		dry = uiTitle.Render("true")
+	}
+	left := fmt.Sprintf("Mode: %-8s State: %s\nDry-run: %s\nDB: %s\nCatalog: %d items\nUptime: %s",
+		m.snap.mode, state, dry, m.snap.db, m.snap.catalogN, shortDuration(time.Since(m.snap.started)))
+	right := fmt.Sprintf("Next buy:  %s\nNext list: %s\nBuy every:  %s\nList every: %s",
+		formatCountdown(m.snap.nextBuy), formatCountdown(m.snap.nextList), m.snap.buyEvery, m.snap.listEvery)
+	stats := fmt.Sprintf("Bought: %-8d Spent: %-12d Created: %-8d Topped: %-8d Pruned: %-8d Errors: %-8d\nLast buy:  %s\nLast list: %s",
+		m.snap.bought, m.snap.spent, m.snap.created, m.snap.topped, m.snap.pruned, m.snap.errors, formatStatusTime(m.snap.lastBuy), formatStatusTime(m.snap.lastLst))
+	cols := lipgloss.JoinHorizontal(lipgloss.Top,
+		uiBox.Width(w/2-3).Render(left),
+		uiBox.Width(w/2-3).Render(right),
+	)
+	return cols + "\n" + uiBox.Width(w-2).Render(uiTitle.Render("Stats")+"\n"+stats) + "\n" + m.recent(w)
+}
+
+func (m marketUIModel) viewActivity(w int) string {
+	return uiBox.Width(w - 2).Render(uiTitle.Render("Activity Log") + "\n" + strings.Join(m.logLines(w-8), "\n"))
+}
+
+func (m marketUIModel) viewConfig(w int) string {
+	cfg := fmt.Sprintf("Mode: %s\nDatabase: %s\nDry-run: %t\nCatalog items: %d\nBuy interval: %s\nList interval: %s\n\nKeys:\n  p pause/resume\n  b buy tick now\n  n list tick now\n  r full tick now\n  q quit",
+		m.snap.mode, m.snap.db, m.snap.dryRun, m.snap.catalogN, m.snap.buyEvery, m.snap.listEvery)
+	return uiBox.Width(w - 2).Render(uiTitle.Render("Config / Controls") + "\n" + cfg)
+}
+
+func (m marketUIModel) recent(w int) string {
+	return uiBox.Width(w - 2).Render(uiTitle.Render("Recent") + "\n" + strings.Join(m.logLines(w-8), "\n"))
+}
+
+func (m marketUIModel) logLines(max int) []string {
+	if len(m.logs) == 0 {
+		return []string{uiHelp.Render("no log lines yet")}
+	}
+	lines := make([]string, 0, len(m.logs))
+	for _, l := range m.logs {
+		lines = append(lines, trimRunes(l, max))
+	}
+	return lines
 }
 
 func formatCountdown(t time.Time) string {
@@ -112,14 +258,14 @@ func shortDuration(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := d / time.Hour
 	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
+	mi := d / time.Minute
+	d -= mi * time.Minute
 	s := d / time.Second
 	if h > 0 {
-		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+		return fmt.Sprintf("%dh%02dm%02ds", h, mi, s)
 	}
-	if m > 0 {
-		return fmt.Sprintf("%dm%02ds", m, s)
+	if mi > 0 {
+		return fmt.Sprintf("%dm%02ds", mi, s)
 	}
 	return fmt.Sprintf("%ds", s)
 }

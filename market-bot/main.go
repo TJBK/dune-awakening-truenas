@@ -172,9 +172,12 @@ func main() {
 	}
 	nextBuy := time.Now().Add(*flagBuyInterval)
 	nextList := time.Now().Add(*flagListInterval)
-	commands := readCommands(ctx)
+	var commands <-chan string
 	if ui != nil {
+		commands = ui.Commands()
 		ui.Render(ex, nextBuy, nextList)
+	} else {
+		commands = readCommands(ctx)
 	}
 	for {
 		select {
